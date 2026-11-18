@@ -304,8 +304,8 @@ def get_time_range(target_date: datetime | None = None) -> tuple[str, str]:
     month = target_date.month
     day = target_date.day
     
-    # Check if between June 16 and Sept 1
-    if (month == 6 and day >= 16) or (7 <= month <= 8) or (month == 9 and day <= 1):
+    # Check if between June 16 and August 31
+    if (month == 6 and day >= 16) or (7 <= month <= 8):
         enter_time, exit_time = "08:00", "15:00"
     else:
         enter_time, exit_time = "08:30", "18:00"
