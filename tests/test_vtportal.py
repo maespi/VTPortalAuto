@@ -7,6 +7,7 @@ from vtportal.browser import (
     parse_target_date,
     get_time_range,
     get_default_work_mode,
+    add_time_jitter,
 )
 from vtportal.config import PortalConfig
 from vtportal.server import mcp, get_schedule_info
@@ -80,6 +81,20 @@ def test_portal_config_validation(monkeypatch):
     assert cfg.username == "myuser"
     assert cfg.password == "mypass"
     assert cfg.headless is False
+    assert cfg.session_file == ".vtportal_session.json"
+
+
+def test_add_time_jitter():
+    # 0 jitter returns exact time
+    assert add_time_jitter("08:30", 0) == "08:30"
+    assert add_time_jitter("18:00", -2) == "18:00"
+
+    # Within +/- 5 minutes
+    for _ in range(20):
+        res = add_time_jitter("08:30", 5)
+        h, m = map(int, res.split(":"))
+        assert h == 8
+        assert 25 <= m <= 35
 
 
 def test_mcp_server_tools_registered():
@@ -90,6 +105,7 @@ def test_mcp_server_tools_registered():
     assert "clock_in_out" in tool_names
     assert "fill_day" in tool_names
     assert "process_period" in tool_names
+    assert "process_dates" in tool_names
     assert "find_missing_dates" in tool_names
     assert "get_schedule_info" in tool_names
 

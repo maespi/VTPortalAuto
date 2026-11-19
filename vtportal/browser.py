@@ -1,10 +1,16 @@
 """Playwright automation client for VisualTime Portal."""
 
+import os
+import random
 import re
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 from playwright.async_api import (
+    Browser,
+    BrowserContext,
     Page,
+    Playwright,
     TimeoutError as PlaywrightTimeoutError,
     async_playwright,
 )
@@ -117,11 +123,215 @@ def get_default_work_mode(target_date: datetime | None = None) -> str:
     return "Teletrabajo"
 
 
+def add_time_jitter(time_str: str, max_minutes: int = 0) -> str:
+    """Add a random variation of [-max_minutes, +max_minutes] to time_str (HH:MM)."""
+    if not max_minutes or max_minutes <= 0:
+        return time_str
+    try:
+        parts = time_str.split(":")
+        if len(parts) != 2:
+            return time_str
+        hours, minutes = int(parts[0]), int(parts[1])
+        delta = random.randint(-max_minutes, max_minutes)
+        total_minutes = hours * 60 + minutes + delta
+        # Clamp to 00:00 - 23:59
+        total_minutes = max(0, min(1439, total_minutes))
+        new_hours = total_minutes // 60
+        new_minutes = total_minutes % 60
+        return f"{new_hours:02d}:{new_minutes:02d}"
+    except Exception:
+        return time_str
+
+
 class VTPortalClient:
     """Manages browser sessions and automation tasks on VTPortal."""
 
     def __init__(self, config: PortalConfig | None = None):
         self.config = config or PortalConfig.from_env()
+        self.session_file = Path(self.config.session_file)
+        self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
+        self._context: BrowserContext | None = None
+        self._main_page: Page | None = None
+        self._popup: Page | None = None
+
+    async def close(self) -> None:
+        """Close active popup, context, browser, and playwright instance."""
+        if self._popup and not self._popup.is_closed():
+            try:
+                await self._popup.close()
+            except Exception:
+                pass
+        self._popup = None
+
+        if self._main_page and not self._main_page.is_closed():
+            try:
+                await self._main_page.close()
+            except Exception:
+                pass
+        self._main_page = None
+
+        if self._context:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+        self._context = None
+
+        if self._browser:
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+        self._browser = None
+
+        if self._playwright:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
+        self._playwright = None
+
+    async def __aenter__(self) -> "VTPortalClient":
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        pass
+
+    async def _init_browser_and_popup(self) -> None:
+        """Initialize playwright, launch chromium, load session storage if exists, and open popup."""
+        logger.info("Initializing Playwright browser and portal session...")
+        if self._popup and not self._popup.is_closed():
+            try:
+                await self._popup.close()
+            except Exception:
+                pass
+            self._popup = None
+
+        if self._context:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+            self._context = None
+
+        if self._browser and not self._browser.is_connected():
+            try:
+                await self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+
+        if not self._playwright:
+            self._playwright = await async_playwright().start()
+
+        if not self._browser:
+            self._browser = await self._playwright.chromium.launch(headless=self.config.headless)
+
+        storage_state = str(self.session_file) if self.session_file.is_file() else None
+        if storage_state:
+            logger.info("Loading cached session from %s", storage_state)
+            try:
+                self._context = await self._browser.new_context(
+                    storage_state=storage_state,
+                    locale="es-ES",
+                )
+            except Exception as e:
+                logger.warning("Could not load storage_state (%s), creating clean context", e)
+                self._context = await self._browser.new_context(locale="es-ES")
+        else:
+            self._context = await self._browser.new_context(locale="es-ES")
+
+        self._main_page = await self._context.new_page()
+        await self._main_page.goto("https://vtportal.visualtime.net/", wait_until="networkidle")
+
+        bt_open = self._main_page.locator("#btOpen")
+        if await bt_open.count() > 0 and await bt_open.first.is_visible():
+            async with self._main_page.expect_popup() as popup_info:
+                await bt_open.first.click()
+            self._popup = await popup_info.value
+        else:
+            self._popup = self._main_page
+
+        await self._popup.wait_for_load_state("networkidle")
+        await self._popup.wait_for_timeout(1000)
+
+    async def _ensure_active_session(self) -> Page:
+        """Ensure Playwright, Browser, Context, and Popup are open, connected, and authenticated."""
+        needs_init = False
+        if not self._playwright or not self._browser or not self._context:
+            needs_init = True
+        elif not self._browser.is_connected():
+            needs_init = True
+        elif not self._popup or self._popup.is_closed():
+            needs_init = True
+
+        if needs_init:
+            await self._init_browser_and_popup()
+
+        assert self._popup is not None
+        await self._ensure_logged_in(self._popup)
+        return self._popup
+
+    async def _check_and_handle_forced_logout(self, popup: Page) -> bool:
+        """Check if session expired or forced out by another system, and re-login if needed."""
+        try:
+            # Check for session expired dialog or alert
+            dismissed_dialog = await popup.evaluate(
+                """() => {
+                    const dialogs = Array.from(document.querySelectorAll('.dx-dialog, .dx-overlay-content'));
+                    for (const d of dialogs) {
+                        const txt = (d.textContent || '').toLowerCase();
+                        if (txt.includes('sesi') || txt.includes('expir') || txt.includes('caduc') || txt.includes('dispositivo')) {
+                            const btn = d.querySelector('.dx-button, [role="button"], button');
+                            if (btn) {
+                                btn.click();
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }"""
+            )
+            if dismissed_dialog:
+                logger.warning("Session expired dialog detected and dismissed")
+                await popup.wait_for_timeout(1000)
+
+            # Check if login form inputs are visible
+            pwd_field = popup.locator("#accessPwd, [data-testid='login-client-field']")
+            if await pwd_field.count() > 0 and await pwd_field.first.is_visible():
+                logger.warning("Forced logout or unauthenticated state detected! Re-authenticating...")
+                await self._login(popup)
+                return True
+        except Exception as e:
+            logger.debug("Error while checking for forced logout: %s", e)
+
+        return False
+
+    async def _ensure_logged_in(self, popup: Page) -> None:
+        """Ensure that the popup is authenticated, logging in if needed."""
+        await popup.wait_for_load_state("networkidle")
+        await popup.wait_for_timeout(800)
+
+        # First handle any forced logout / session expired alert
+        if await self._check_and_handle_forced_logout(popup):
+            return
+
+        is_logged_in = await popup.evaluate(
+            """() => {
+                const hasMenu = !!document.querySelector('.dx-menu-hamburger-button, .dx-icon-menu, #btnActionMenuPopover');
+                const hasApp = typeof window.VTPortal !== 'undefined' && window.VTPortal.app;
+                const hasLoginField = !!document.querySelector('#accessPwd, [data-testid="login-client-field"]');
+                return (hasMenu || hasApp) && !hasLoginField;
+            }"""
+        )
+
+        if is_logged_in:
+            logger.debug("Session is active and already logged in (using cached session)")
+            return
+
+        logger.info("Session not active or login form present. Performing login...")
+        await self._login(popup)
 
     async def _set_dx_textbox(self, page: Page, selector: str, value: str, widget_name: str = "dxTextBox") -> dict[str, Any]:
         """Directly set DevExpress text widget value and trigger events."""
@@ -416,11 +626,22 @@ class VTPortalClient:
         await popup.wait_for_timeout(2000)
         logger.info("Login completed successfully")
 
+        if self.session_file:
+            try:
+                await popup.context.storage_state(path=str(self.session_file))
+                logger.info("Saved updated session storage to %s", self.session_file)
+            except Exception as e:
+                logger.warning("Failed to save storage_state: %s", e)
+
     async def _navigate_to_gestion_horaria(self, popup: Page, target_date: datetime | None = None) -> None:
         """Navigate to 'Gestión horaria' (scheduler view) for the target date."""
         dt = target_date or datetime.now()
         date_str = dt.strftime("%Y-%m-%d")
         logger.debug("Navigating to scheduler for %s...", date_str)
+
+        # Handle forced logout before navigation
+        if await self._check_and_handle_forced_logout(popup):
+            await popup.wait_for_timeout(1000)
 
         # If on a sub-view (like Detalle de fichajes), click Back button safely to return to scheduler view
         try:
@@ -453,6 +674,19 @@ class VTPortalClient:
                     await popup.wait_for_selector(".dx-loadpanel, .dx-overlay-shader", state="hidden", timeout=5000)
                 except Exception:
                     pass
+
+                # Check if navigation triggered a forced logout redirect
+                if await self._check_and_handle_forced_logout(popup):
+                    await popup.wait_for_timeout(1000)
+                    await popup.evaluate(
+                        """([dateStr]) => {
+                            if (window.VTPortal && window.VTPortal.app && typeof window.VTPortal.app.navigate === 'function') {
+                                window.VTPortal.app.navigate('scheduler/1/' + dateStr);
+                            }
+                        }""",
+                        [date_str],
+                    )
+                    await popup.wait_for_timeout(1500)
                 return
         except Exception as e:
             logger.warning("Direct SPA navigate to scheduler failed: %s", e)
@@ -474,6 +708,8 @@ class VTPortalClient:
                 }"""
             )
             await popup.wait_for_timeout(1500)
+            if await self._check_and_handle_forced_logout(popup):
+                await popup.wait_for_timeout(1000)
         except Exception as e:
             logger.warning("Hamburger navigation fallback failed: %s", e)
 
@@ -561,6 +797,10 @@ class VTPortalClient:
             (success: bool, status_code: str)
             status_code can be 'selected', 'holiday', or 'not_found'.
         """
+        # Check forced logout before calendar operations
+        if await self._check_and_handle_forced_logout(popup):
+            await self._navigate_to_gestion_horaria(popup, target_date)
+
         await popup.wait_for_timeout(500)
         navigated = await self._navigate_calendar_to_month(popup, target_date.month, target_date.year)
         if not navigated:
@@ -569,19 +809,56 @@ class VTPortalClient:
         async def check_is_holiday(loc) -> bool:
             try:
                 return await loc.evaluate(
-                    """(el) => {
-                        // If cell explicitly indicates work presence shift, it is not a holiday or vacation
+                    r"""(el) => {
+                        // 1. If cell explicitly has a work presence shift indicator, it is a normal working day
                         if (el.querySelector('.dx-icon-Cal_TC_Presence, [class*="Presence"], [class*="presence"]')) {
                             return false;
                         }
-                        const html = el.outerHTML.toLowerCase();
-                        // Red (#ff0000) for public holidays, Yellow (#ffff00) for approved vacations
-                        return html.includes('#ff0000') ||
-                               html.includes('#ffff00') ||
-                               html.includes('rgb(255, 0, 0)') ||
-                               html.includes('rgb(255, 255, 0)') ||
-                               html.includes('rgb(255,0,0)') ||
-                               html.includes('rgb(255,255,0)');
+
+                        // 2. Check tooltip, title, and aria-label for explicit holiday/vacation/leave terms
+                        const title = (el.getAttribute('title') || '').toLowerCase();
+                        const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+                        const leaveTerms = ['festiv', 'vacac', 'holiday', 'fiesta laboral', 'convenio', 'permiso', 'ausencia', 'baja', 'leave'];
+                        for (const term of leaveTerms) {
+                            if (title.includes(term) || ariaLabel.includes(term)) {
+                                return true;
+                            }
+                        }
+
+                        // 3. Check for explicit holiday/absence icons or class names
+                        const holidaySelector = [
+                            '.dx-icon-Cal_TC_Holiday',
+                            '.dx-icon-Cal_TC_Absence',
+                            '[class*="holiday" i]',
+                            '[class*="festiv" i]',
+                            '[class*="vacacion" i]',
+                            '[class*="permiso" i]',
+                            '[class*="ausencia" i]',
+                            '[class*="baja" i]'
+                        ].join(',');
+                        if (el.querySelector(holidaySelector)) {
+                            return true;
+                        }
+
+                        // 4. Check for special leave / absence styling or border in the daily template
+                        const innerDiv = el.querySelector('.innerCalCellTemplate > div, .CalendarCellDailyLayout div');
+                        if (innerDiv) {
+                            const style = innerDiv.getAttribute('style') || '';
+                            if (style.includes('#a400cc') || style.includes('rgb(164, 0, 204)')) {
+                                return true;
+                            }
+                        }
+
+                        // 5. On a weekday, if there is no presence icon, it represents an absence, special leave, or holiday
+                        const isWeekendCell = el.classList.contains('dx-calendar-cell-weekend') ||
+                                              ariaLabel.includes('sábado') ||
+                                              ariaLabel.includes('domingo') ||
+                                              ariaLabel.includes('sabado');
+                        if (!isWeekendCell) {
+                            return true;
+                        }
+
+                        return false;
                     }"""
                 )
             except Exception:
@@ -821,48 +1098,41 @@ class VTPortalClient:
             result["message"] = f"{date_str} is a weekend ({day_of_week})."
             return result
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=self.config.headless)
-            try:
-                page = await browser.new_page(locale="es-ES")
-                await page.goto("https://vtportal.visualtime.net/", wait_until="networkidle")
+        try:
+            popup = await self._ensure_active_session()
+            await self._navigate_to_gestion_horaria(popup, target_date)
 
-                async with page.expect_popup() as popup_info:
-                    await page.click("#btOpen")
-                popup = await popup_info.value
-
-                await self._login(popup)
-                await self._navigate_to_gestion_horaria(popup)
-
-                selected, status_code = await self._select_calendar_day(popup, target_date)
-                if status_code == "holiday":
-                    result["is_holiday_or_vacation"] = True
-                    result["status"] = "holiday"
-                    result["message"] = f"{date_str} is marked as a holiday or vacation."
-                    return result
-                if not selected:
-                    result["status"] = "not_found"
-                    result["message"] = f"Could not find or select {date_str} in calendar."
-                    return result
-
-                clicked_details = await self._click_detalles_de_fichajes(popup)
-                if not clicked_details:
-                    result["status"] = "error"
-                    result["message"] = "Could not open Detalle de fichajes."
-                    return result
-
-                entries_info = await self._inspect_day_entries(popup)
-                result["has_entrada"] = entries_info.get("entrada", False)
-                result["has_salida"] = entries_info.get("salida", False)
-                result["entries"] = entries_info.get("items", [])
-                result["status"] = "ok"
-                result["message"] = (
-                    f"Status for {date_str}: entrada={'yes' if result['has_entrada'] else 'no'}, "
-                    f"salida={'yes' if result['has_salida'] else 'no'}."
-                )
+            selected, status_code = await self._select_calendar_day(popup, target_date)
+            if status_code == "holiday":
+                result["is_holiday_or_vacation"] = True
+                result["status"] = "holiday"
+                result["message"] = f"{date_str} is marked as a holiday or vacation."
                 return result
-            finally:
-                await browser.close()
+            if not selected:
+                result["status"] = "not_found"
+                result["message"] = f"Could not find or select {date_str} in calendar."
+                return result
+
+            clicked_details = await self._click_detalles_de_fichajes(popup)
+            if not clicked_details:
+                result["status"] = "error"
+                result["message"] = "Could not open Detalle de fichajes."
+                return result
+
+            entries_info = await self._inspect_day_entries(popup)
+            result["has_entrada"] = entries_info.get("entrada", False)
+            result["has_salida"] = entries_info.get("salida", False)
+            result["entries"] = entries_info.get("items", [])
+            result["status"] = "ok"
+            result["message"] = (
+                f"Status for {date_str}: entrada={'yes' if result['has_entrada'] else 'no'}, "
+                f"salida={'yes' if result['has_salida'] else 'no'}."
+            )
+            return result
+        except Exception as e:
+            logger.error("check_day_status failed: %s", e)
+            await self.close()
+            raise
 
     async def clock_in_out(
         self,
@@ -871,6 +1141,7 @@ class VTPortalClient:
         time_value: str | None = None,
         work_mode: str | None = None,
         force: bool = False,
+        jitter_minutes: int = 0,
     ) -> dict[str, Any]:
         """Submit a single entrada or salida time request."""
         target_date = parse_target_date(date_val)
@@ -880,47 +1151,43 @@ class VTPortalClient:
 
         default_enter, default_exit = get_time_range(target_date)
         actual_time = time_value or (default_enter if req_type == "entrada" else default_exit)
+        if jitter_minutes > 0 and not time_value:
+            actual_time = add_time_jitter(actual_time, jitter_minutes)
+
         actual_work_mode = work_mode or get_default_work_mode(target_date)
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=self.config.headless)
-            try:
-                page = await browser.new_page(locale="es-ES")
-                await page.goto("https://vtportal.visualtime.net/", wait_until="networkidle")
+        try:
+            popup = await self._ensure_active_session()
+            await self._navigate_to_gestion_horaria(popup, target_date)
 
-                async with page.expect_popup() as popup_info:
-                    await page.click("#btOpen")
-                popup = await popup_info.value
+            selected, status_code = await self._select_calendar_day(popup, target_date)
+            if status_code == "holiday" and not force:
+                return {
+                    "success": False,
+                    "status": "holiday",
+                    "message": f"{target_date.date()} is marked as a holiday or vacation. Skipped.",
+                }
+            if not selected:
+                return {
+                    "success": False,
+                    "status": "not_found",
+                    "message": f"Could not find or select {target_date.date()} in calendar.",
+                }
 
-                await self._login(popup)
-                await self._navigate_to_gestion_horaria(popup)
-
-                selected, status_code = await self._select_calendar_day(popup, target_date)
-                if status_code == "holiday" and not force:
-                    return {
-                        "success": False,
-                        "status": "holiday",
-                        "message": f"{target_date.date()} is marked as a holiday or vacation. Skipped.",
-                    }
-                if not selected:
-                    return {
-                        "success": False,
-                        "status": "not_found",
-                        "message": f"Could not find or select {target_date.date()} in calendar.",
-                    }
-
-                await self._click_detalles_de_fichajes(popup)
-                res = await self._submit_time_request_internal(
-                    popup,
-                    req_type,
-                    actual_time,
-                    target_date,
-                    work_mode=actual_work_mode,
-                    force=force,
-                )
-                return res
-            finally:
-                await browser.close()
+            await self._click_detalles_de_fichajes(popup)
+            res = await self._submit_time_request_internal(
+                popup,
+                req_type,
+                actual_time,
+                target_date,
+                work_mode=actual_work_mode,
+                force=force,
+            )
+            return res
+        except Exception as e:
+            logger.error("clock_in_out failed: %s", e)
+            await self.close()
+            raise
 
     async def fill_day(
         self,
@@ -929,6 +1196,7 @@ class VTPortalClient:
         enter_time: str | None = None,
         exit_time: str | None = None,
         skip_if_holiday: bool = True,
+        jitter_minutes: int = 0,
     ) -> dict[str, Any]:
         """Fill both entrada and salida for a given day (skipping existing entries)."""
         target_date = parse_target_date(date_val)
@@ -944,71 +1212,181 @@ class VTPortalClient:
         default_enter, default_exit = get_time_range(target_date)
         actual_enter = enter_time or default_enter
         actual_exit = exit_time or default_exit
+        if jitter_minutes > 0:
+            if not enter_time:
+                actual_enter = add_time_jitter(actual_enter, jitter_minutes)
+            if not exit_time:
+                actual_exit = add_time_jitter(actual_exit, jitter_minutes)
+
         actual_work_mode = work_mode or get_default_work_mode(target_date)
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=self.config.headless)
-            try:
-                page = await browser.new_page(locale="es-ES")
-                await page.goto("https://vtportal.visualtime.net/", wait_until="networkidle")
+        try:
+            popup = await self._ensure_active_session()
+            await self._navigate_to_gestion_horaria(popup, target_date)
 
-                async with page.expect_popup() as popup_info:
-                    await page.click("#btOpen")
-                popup = await popup_info.value
+            selected, status_code = await self._select_calendar_day(popup, target_date)
+            if status_code == "holiday" and skip_if_holiday:
+                return {
+                    "date": date_str,
+                    "status": "skipped_holiday",
+                    "message": f"{date_str} is marked as holiday / vacation. Skipped.",
+                }
+            if not selected:
+                return {
+                    "date": date_str,
+                    "status": "error",
+                    "message": f"Could not select {date_str} in calendar.",
+                }
 
-                await self._login(popup)
-                await self._navigate_to_gestion_horaria(popup, target_date)
+            await self._click_detalles_de_fichajes(popup)
+            res_in = await self._submit_time_request_internal(
+                popup,
+                "entrada",
+                actual_enter,
+                target_date,
+                work_mode=actual_work_mode,
+            )
 
-                selected, status_code = await self._select_calendar_day(popup, target_date)
-                if status_code == "holiday" and skip_if_holiday:
-                    return {
-                        "date": date_str,
-                        "status": "skipped_holiday",
-                        "message": f"{date_str} is marked as holiday / vacation. Skipped.",
-                    }
-                if not selected:
-                    return {
-                        "date": date_str,
-                        "status": "error",
-                        "message": f"Could not select {date_str} in calendar.",
-                    }
-
-                await self._click_detalles_de_fichajes(popup)
-                res_in = await self._submit_time_request_internal(
-                    popup,
-                    "entrada",
-                    actual_enter,
-                    target_date,
-                    work_mode=actual_work_mode,
-                )
-
-                # Re-navigate to Gestion Horaria for salida
-                await self._navigate_to_gestion_horaria(popup, target_date)
-                selected_exit, _ = await self._select_calendar_day(popup, target_date)
-                if not selected_exit:
-                    return {
-                        "date": date_str,
-                        "entrada": res_in,
-                        "salida": {"success": False, "error": "Could not re-select day for salida"},
-                    }
-
-                await self._click_detalles_de_fichajes(popup)
-                res_out = await self._submit_time_request_internal(
-                    popup,
-                    "salida",
-                    actual_exit,
-                    target_date,
-                    work_mode=actual_work_mode,
-                )
-
+            # Re-navigate to Gestion Horaria for salida
+            await self._navigate_to_gestion_horaria(popup, target_date)
+            selected_exit, _ = await self._select_calendar_day(popup, target_date)
+            if not selected_exit:
                 return {
                     "date": date_str,
                     "entrada": res_in,
-                    "salida": res_out,
-                    "status": "completed",
+                    "salida": {"success": False, "error": "Could not re-select day for salida"},
                 }
-            finally:
-                await browser.close()
+
+            await self._click_detalles_de_fichajes(popup)
+            res_out = await self._submit_time_request_internal(
+                popup,
+                "salida",
+                actual_exit,
+                target_date,
+                work_mode=actual_work_mode,
+            )
+
+            return {
+                "date": date_str,
+                "entrada": res_in,
+                "salida": res_out,
+                "status": "completed",
+            }
+        except Exception as e:
+            logger.error("fill_day failed: %s", e)
+            await self.close()
+            raise
+
+    async def process_dates(
+        self,
+        dates: list[str | datetime],
+        skip_weekends: bool = True,
+        skip_holidays: bool = True,
+        work_mode: str | None = None,
+        work_mode_map: dict[str, str] | None = None,
+        enter_time: str | None = None,
+        exit_time: str | None = None,
+        jitter_minutes: int = 0,
+    ) -> dict[str, Any]:
+        """Iterate a specific list of dates and auto-fill missing clock-in/out entries."""
+        results = []
+        try:
+            popup = await self._ensure_active_session()
+
+            for d_val in dates:
+                cur = parse_target_date(d_val)
+                cur_str = cur.strftime("%Y-%m-%d")
+
+                if skip_weekends and cur.weekday() >= 5:
+                    results.append({
+                        "date": cur_str,
+                        "status": "skipped_weekend",
+                        "message": "Weekend day skipped",
+                    })
+                    continue
+
+                default_in, default_out = get_time_range(cur)
+                day_enter = enter_time or default_in
+                day_exit = exit_time or default_out
+
+                if jitter_minutes > 0:
+                    if not enter_time:
+                        day_enter = add_time_jitter(day_enter, jitter_minutes)
+                    if not exit_time:
+                        day_exit = add_time_jitter(day_exit, jitter_minutes)
+
+                if work_mode_map and cur_str in work_mode_map:
+                    day_mode = work_mode_map[cur_str]
+                else:
+                    day_mode = work_mode or get_default_work_mode(cur)
+
+                try:
+                    await self._navigate_to_gestion_horaria(popup, cur)
+                    selected, status_code = await self._select_calendar_day(popup, cur)
+                    if status_code == "holiday" and skip_holidays:
+                        results.append({
+                            "date": cur_str,
+                            "status": "skipped_holiday",
+                            "message": "Holiday/vacation day skipped",
+                        })
+                        continue
+
+                    if not selected:
+                        results.append({
+                            "date": cur_str,
+                            "status": "error",
+                            "message": "Could not select calendar day",
+                        })
+                        continue
+
+                    # Entrada
+                    await self._click_detalles_de_fichajes(popup)
+                    res_in = await self._submit_time_request_internal(
+                        popup, "entrada", day_enter, cur, work_mode=day_mode
+                    )
+
+                    # Salida
+                    await self._navigate_to_gestion_horaria(popup, cur)
+                    selected_exit, _ = await self._select_calendar_day(popup, cur)
+                    if selected_exit:
+                        await self._click_detalles_de_fichajes(popup)
+                        res_out = await self._submit_time_request_internal(
+                            popup, "salida", day_exit, cur, work_mode=day_mode
+                        )
+                    else:
+                        res_out = {"success": False, "error": "Could not re-select day for salida"}
+
+                    results.append({
+                        "date": cur_str,
+                        "entrada": res_in,
+                        "salida": res_out,
+                        "status": "completed",
+                    })
+
+                    await popup.wait_for_timeout(600)
+                except Exception as e:
+                    logger.error("Error processing day %s: %s", cur_str, e)
+                    if await self._check_and_handle_forced_logout(popup):
+                        results.append({
+                            "date": cur_str,
+                            "status": "recovered_relogin",
+                            "error": f"Forced logout encountered and recovered: {e}",
+                        })
+                    else:
+                        results.append({
+                            "date": cur_str,
+                            "status": "error",
+                            "error": str(e),
+                        })
+
+            return {
+                "total_days": len(results),
+                "days": results,
+            }
+        except Exception as e:
+            logger.error("process_dates failed: %s", e)
+            await self.close()
+            raise
 
     async def process_period(
         self,
@@ -1018,6 +1396,9 @@ class VTPortalClient:
         skip_holidays: bool = True,
         work_mode: str | None = None,
         work_mode_map: dict[str, str] | None = None,
+        enter_time: str | None = None,
+        exit_time: str | None = None,
+        jitter_minutes: int = 0,
     ) -> dict[str, Any]:
         """Iterate all days in [start_date, end_date] and auto-fill entries."""
         start_dt = parse_target_date(start_date_val)
@@ -1026,101 +1407,25 @@ class VTPortalClient:
         if end_dt < start_dt:
             raise ValueError(f"End date ({end_dt.date()}) is before start date ({start_dt.date()}).")
 
-        results = []
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=self.config.headless)
-            try:
-                page = await browser.new_page(locale="es-ES")
-                await page.goto("https://vtportal.visualtime.net/", wait_until="networkidle")
+        date_list = []
+        cur = start_dt
+        while cur.date() <= end_dt.date():
+            date_list.append(cur)
+            cur += timedelta(days=1)
 
-                async with page.expect_popup() as popup_info:
-                    await page.click("#btOpen")
-                popup = await popup_info.value
-
-                await self._login(popup)
-
-                cur = start_dt
-                while cur.date() <= end_dt.date():
-                    cur_str = cur.strftime("%Y-%m-%d")
-                    if skip_weekends and cur.weekday() >= 5:
-                        results.append({
-                            "date": cur_str,
-                            "status": "skipped_weekend",
-                            "message": "Weekend day skipped",
-                        })
-                        cur += timedelta(days=1)
-                        continue
-
-                    enter_time, exit_time = get_time_range(cur)
-                    if work_mode_map and cur_str in work_mode_map:
-                        day_mode = work_mode_map[cur_str]
-                    else:
-                        day_mode = work_mode or get_default_work_mode(cur)
-
-                    try:
-                        await self._navigate_to_gestion_horaria(popup, cur)
-                        selected, status_code = await self._select_calendar_day(popup, cur)
-                        if status_code == "holiday" and skip_holidays:
-                            results.append({
-                                "date": cur_str,
-                                "status": "skipped_holiday",
-                                "message": "Holiday/vacation day skipped",
-                            })
-                            cur += timedelta(days=1)
-                            continue
-
-                        if not selected:
-                            results.append({
-                                "date": cur_str,
-                                "status": "error",
-                                "message": "Could not select calendar day",
-                            })
-                            cur += timedelta(days=1)
-                            continue
-
-                        # Entrada
-                        await self._click_detalles_de_fichajes(popup)
-                        res_in = await self._submit_time_request_internal(
-                            popup, "entrada", enter_time, cur, work_mode=day_mode
-                        )
-
-                        # Salida
-                        await self._navigate_to_gestion_horaria(popup, cur)
-                        selected_exit, _ = await self._select_calendar_day(popup, cur)
-                        if selected_exit:
-                            await self._click_detalles_de_fichajes(popup)
-                            res_out = await self._submit_time_request_internal(
-                                popup, "salida", exit_time, cur, work_mode=day_mode
-                            )
-                        else:
-                            res_out = {"success": False, "error": "Could not re-select day for salida"}
-
-                        results.append({
-                            "date": cur_str,
-                            "entrada": res_in,
-                            "salida": res_out,
-                            "status": "completed",
-                        })
-
-                        await popup.wait_for_timeout(800)
-                    except Exception as e:
-                        logger.error("Error processing day %s: %s", cur_str, e)
-                        results.append({
-                            "date": cur_str,
-                            "status": "error",
-                            "error": str(e),
-                        })
-
-                    cur += timedelta(days=1)
-
-                return {
-                    "start_date": start_dt.strftime("%Y-%m-%d"),
-                    "end_date": end_dt.strftime("%Y-%m-%d"),
-                    "total_days": len(results),
-                    "days": results,
-                }
-            finally:
-                await browser.close()
+        res = await self.process_dates(
+            dates=date_list,
+            skip_weekends=skip_weekends,
+            skip_holidays=skip_holidays,
+            work_mode=work_mode,
+            work_mode_map=work_mode_map,
+            enter_time=enter_time,
+            exit_time=exit_time,
+            jitter_minutes=jitter_minutes,
+        )
+        res["start_date"] = start_dt.strftime("%Y-%m-%d")
+        res["end_date"] = end_dt.strftime("%Y-%m-%d")
+        return res
 
     async def find_missing_dates(
         self,
@@ -1140,98 +1445,93 @@ class VTPortalClient:
         holidays = []
         weekends = []
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=self.config.headless)
-            try:
-                page = await browser.new_page(locale="es-ES")
-                await page.goto("https://vtportal.visualtime.net/", wait_until="networkidle")
+        try:
+            popup = await self._ensure_active_session()
+            cur = start_dt
+            while cur.date() <= end_dt.date():
+                cur_str = cur.strftime("%Y-%m-%d")
+                day_name = cur.strftime("%A")
 
-                async with page.expect_popup() as popup_info:
-                    await page.click("#btOpen")
-                popup = await popup_info.value
+                if cur.weekday() >= 5:
+                    weekends.append(cur_str)
+                    cur += timedelta(days=1)
+                    continue
 
-                await self._login(popup)
-
-                cur = start_dt
-                while cur.date() <= end_dt.date():
-                    cur_str = cur.strftime("%Y-%m-%d")
-                    day_name = cur.strftime("%A")
-
-                    if cur.weekday() >= 5:
-                        weekends.append(cur_str)
+                try:
+                    await self._navigate_to_gestion_horaria(popup, cur)
+                    selected, status_code = await self._select_calendar_day(popup, cur)
+                    if status_code == "holiday":
+                        holidays.append({"date": cur_str, "day": day_name})
                         cur += timedelta(days=1)
                         continue
 
-                    try:
-                        await self._navigate_to_gestion_horaria(popup, cur)
-                        selected, status_code = await self._select_calendar_day(popup, cur)
-                        if status_code == "holiday":
-                            holidays.append({"date": cur_str, "day": day_name})
-                            cur += timedelta(days=1)
-                            continue
-
-                        if not selected:
-                            missing_days.append({
-                                "date": cur_str,
-                                "day": day_name,
-                                "status": "could_not_select",
-                                "missing": ["entrada", "salida"],
-                            })
-                            cur += timedelta(days=1)
-                            continue
-
-                        await self._click_detalles_de_fichajes(popup)
-                        entries_info = await self._inspect_day_entries(popup)
-                        has_in = entries_info.get("entrada", False)
-                        has_out = entries_info.get("salida", False)
-
-                        missing_types = []
-                        if not has_in:
-                            missing_types.append("entrada")
-                        if not has_out:
-                            missing_types.append("salida")
-
-                        expected_enter, expected_exit = get_time_range(cur)
-                        default_mode = get_default_work_mode(cur)
-
-                        day_record = {
-                            "date": cur_str,
-                            "day": day_name,
-                            "has_entrada": has_in,
-                            "has_salida": has_out,
-                            "missing": missing_types,
-                            "expected_schedule": {
-                                "enter_time": expected_enter,
-                                "exit_time": expected_exit,
-                                "work_mode": default_mode,
-                            },
-                        }
-
-                        if missing_types:
-                            missing_days.append(day_record)
-                        else:
-                            completed_days.append(day_record)
-
-                        await popup.wait_for_timeout(600)
-                    except Exception as e:
-                        logger.error("Error inspecting day %s: %s", cur_str, e)
+                    if not selected:
                         missing_days.append({
                             "date": cur_str,
                             "day": day_name,
-                            "error": str(e),
-                            "missing": ["unknown"],
+                            "status": "could_not_select",
+                            "missing": ["entrada", "salida"],
                         })
+                        cur += timedelta(days=1)
+                        continue
 
-                    cur += timedelta(days=1)
+                    await self._click_detalles_de_fichajes(popup)
+                    entries_info = await self._inspect_day_entries(popup)
+                    has_in = entries_info.get("entrada", False)
+                    has_out = entries_info.get("salida", False)
 
-                return {
-                    "start_date": start_dt.strftime("%Y-%m-%d"),
-                    "end_date": end_dt.strftime("%Y-%m-%d"),
-                    "missing_days_count": len(missing_days),
-                    "missing_days": missing_days,
-                    "completed_days_count": len(completed_days),
-                    "completed_days": completed_days,
-                    "holidays": holidays,
-                }
-            finally:
-                await browser.close()
+                    missing_types = []
+                    if not has_in:
+                        missing_types.append("entrada")
+                    if not has_out:
+                        missing_types.append("salida")
+
+                    expected_enter, expected_exit = get_time_range(cur)
+                    default_mode = get_default_work_mode(cur)
+
+                    day_record = {
+                        "date": cur_str,
+                        "day": day_name,
+                        "has_entrada": has_in,
+                        "has_salida": has_out,
+                        "missing": missing_types,
+                        "expected_schedule": {
+                            "enter_time": expected_enter,
+                            "exit_time": expected_exit,
+                            "work_mode": default_mode,
+                        },
+                    }
+
+                    if missing_types:
+                        missing_days.append(day_record)
+                    else:
+                        completed_days.append(day_record)
+
+                    await popup.wait_for_timeout(500)
+                except Exception as e:
+                    logger.error("Error inspecting day %s: %s", cur_str, e)
+                    if await self._check_and_handle_forced_logout(popup):
+                        logger.info("Recovered from forced logout, retrying day %s", cur_str)
+                        continue
+                    missing_days.append({
+                        "date": cur_str,
+                        "day": day_name,
+                        "error": str(e),
+                        "missing": ["unknown"],
+                    })
+
+                cur += timedelta(days=1)
+
+            return {
+                "start_date": start_dt.strftime("%Y-%m-%d"),
+                "end_date": end_dt.strftime("%Y-%m-%d"),
+                "missing_days_count": len(missing_days),
+                "missing_days": missing_days,
+                "completed_days_count": len(completed_days),
+                "completed_days": completed_days,
+                "holidays": holidays,
+            }
+        except Exception as e:
+            logger.error("find_missing_dates failed: %s", e)
+            await self.close()
+            raise

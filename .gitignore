@@ -20,3 +20,8 @@ build/
 test-results/
 playwright-report/
 blob-report/
+
+# Session cache
+.vtportal_session.json
+*.session.json
+

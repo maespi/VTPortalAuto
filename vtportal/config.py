@@ -28,6 +28,7 @@ class PortalConfig:
     language: str = "ESP"
     headless: bool = True
     timeout_ms: int = 30000
+    session_file: str = ".vtportal_session.json"
 
     @classmethod
     def from_env(cls) -> "PortalConfig":
@@ -38,6 +39,7 @@ class PortalConfig:
         language = os.getenv("VTPORTAL_LANGUAGE", "ESP").strip() or "ESP"
         headless_str = os.getenv("HEADLESS", "true").strip().lower()
         headless = headless_str not in ("0", "false", "no")
+        session_file = os.getenv("VTPORTAL_SESSION_FILE", ".vtportal_session.json").strip() or ".vtportal_session.json"
         
         try:
             timeout_ms = int(os.getenv("VTPORTAL_TIMEOUT_MS", "30000"))
@@ -65,4 +67,5 @@ class PortalConfig:
             language=language,
             headless=headless,
             timeout_ms=timeout_ms,
+            session_file=session_file,
         )

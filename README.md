@@ -260,16 +260,24 @@ Add to `.cursor/mcp.json` in your workspace or global settings:
 
 ## 🛠️ MCP Tools Reference
 
-The server registers 6 tools accessible by AI models:
+The server registers 7 tools accessible by AI models:
 
 | Tool Name | Parameters | Description |
 | :--- | :--- | :--- |
 | `check_day_status` | `date` (optional) | Returns clock-in status, entry details, holiday status, and expected schedule for a single day. |
 | `find_missing_dates` | `start_date`, `end_date` | Scans calendar range, returning missing days, completed days, and identified holidays/vacations. |
-| `clock_in_out` | `request_type`, `date`, `time`, `work_mode`, `force` | Submits a single `entrada` or `salida`. Uses company defaults if time/mode are omitted. |
-| `fill_day` | `date`, `work_mode`, `enter_time`, `exit_time`, `skip_if_holiday` | Automatically ensures both `entrada` and `salida` are registered for a day. |
-| `process_period` | `start_date`, `end_date`, `skip_weekends`, `skip_holidays`, `work_mode` | Submits all missing entries across a date range in a single browser session. |
+| `clock_in_out` | `request_type`, `date`, `time`, `work_mode`, `force`, `jitter_minutes` | Submits a single `entrada` or `salida`. Uses company defaults if time/mode are omitted. |
+| `fill_day` | `date`, `work_mode`, `enter_time`, `exit_time`, `skip_if_holiday`, `jitter_minutes` | Automatically ensures both `entrada` and `salida` are registered for a day. |
+| `process_period` | `start_date`, `end_date`, `skip_weekends`, `skip_holidays`, `work_mode`, `jitter_minutes` | Submits all missing entries across a date range in a single browser session. |
+| `process_dates` | `dates`, `skip_weekends`, `skip_holidays`, `work_mode`, `enter_time`, `exit_time`, `jitter_minutes` | Submits all missing entries for an explicit list of dates (e.g. from `find_missing_dates`). |
 | `get_schedule_info` | `date` (optional) | Fast offline lookup of expected hours, summer schedule status, and work mode without launching a browser. |
+
+### ⚡ Performance & Reliability Features
+
+- **Persistent Browser & Session Caching**: The server reuses an active browser instance and caches authentication tokens in `.vtportal_session.json`, skipping repetitive logins (~10–15s saved per call).
+- **Forced Logout Auto-Recovery**: If another system logs into VisualTime and invalidates the session, the client detects the login screen or expiration modal, logs back in automatically, and resumes without failing.
+- **Accurate Holiday & Vacation Detection**: Calendar cells distinguish between true absences/holidays (e.g., solid color backgrounds, explicit holiday classes) and incidence/alert warning badges (e.g., missing clock-in warnings).
+- **Humanized Timing (Jitter)**: Add random variation (e.g. `jitter_minutes=5` varies +/- 5 min) so attendance timestamps look organic.
 
 ### Tool Details & Examples
 
