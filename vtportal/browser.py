@@ -1475,8 +1475,12 @@ class VTPortalClient:
                         cur += timedelta(days=1)
                         continue
 
-                    await self._click_detalles_de_fichajes(popup)
-                    entries_info = await self._inspect_day_entries(popup)
+                    clicked_details = await self._click_detalles_de_fichajes(popup)
+                    if clicked_details:
+                        entries_info = await self._inspect_day_entries(popup)
+                    else:
+                        entries_info = {"entrada": False, "salida": False}
+
                     has_in = entries_info.get("entrada", False)
                     has_out = entries_info.get("salida", False)
 
@@ -1507,7 +1511,7 @@ class VTPortalClient:
                     else:
                         completed_days.append(day_record)
 
-                    await popup.wait_for_timeout(500)
+                    await popup.wait_for_timeout(250)
                 except Exception as e:
                     logger.error("Error inspecting day %s: %s", cur_str, e)
                     if await self._check_and_handle_forced_logout(popup):
